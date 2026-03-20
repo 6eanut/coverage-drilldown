@@ -49,11 +49,54 @@ def find_tool(*candidates):
 
 # ── Address extraction ────────────────────────────────────────────────────────
 
+def get_init_exit_ranges(vmlinux: str, objdump: str) -> list[tuple[int, int]]:
+    """
+    Parse 'objdump -h vmlinux' to find address ranges of .init.text and
+    .exit.text sections. Functions there are __init/__exit and cannot be
+    triggered at runtime via system calls.
+    Returns list of (start, end) integer pairs (end exclusive).
+    """
+    ranges: list[tuple[int, int]] = []
+    try:
+        out = subprocess.check_output(
+            [objdump, "-h", vmlinux],
+            stderr=subprocess.DEVNULL, text=True,
+        )
+    except subprocess.CalledProcessError:
+        return ranges
+    # objdump -h line:  Idx Name   Size      VMA               ...
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        name = parts[1]
+        if name not in (".init.text", ".exit.text"):
+            continue
+        try:
+            size  = int(parts[2], 16)
+            start = int(parts[3], 16)
+            ranges.append((start, start + size))
+            print(f"  [init/exit filter] {name}: "
+                  f"0x{start:016x} - 0x{start+size:016x}")
+        except (ValueError, IndexError):
+            continue
+    if not ranges:
+        print("  [init/exit filter] No .init.text/.exit.text found")
+    return ranges
+
+
+def in_init_exit(addr_int: int, ranges: list[tuple[int, int]]) -> bool:
+    return any(s <= addr_int < e for s, e in ranges)
+
+
 def extract_kcov_addrs(vmlinux: str, objdump: str) -> list[str]:
+    init_exit_ranges = get_init_exit_ranges(vmlinux, objdump)
+
     print(f"  [objdump] Disassembling {os.path.basename(vmlinux)} ...")
     cmd = [objdump, "-d", "--no-show-raw-insn", vmlinux]
     addrs: list[str] = []
     seen:  set[str]  = set()
+    skipped = 0
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL, text=True, bufsize=1 << 20)
@@ -61,15 +104,23 @@ def extract_kcov_addrs(vmlinux: str, objdump: str) -> list[str]:
             if "__sanitizer_cov_trace_pc>" not in line:
                 continue
             m = re.match(r"^\s*([0-9a-f]+):", line)
-            if m:
-                a = "0x" + m.group(1)
-                if a not in seen:
-                    seen.add(a)
-                    addrs.append(a)
+            if not m:
+                continue
+            a_hex = m.group(1)
+            a_int = int(a_hex, 16)
+            if init_exit_ranges and in_init_exit(a_int, init_exit_ranges):
+                skipped += 1
+                continue
+            a = "0x" + a_hex
+            if a not in seen:
+                seen.add(a)
+                addrs.append(a)
         proc.wait()
     except FileNotFoundError:
         print(f"  ERROR: {objdump} not found"); sys.exit(1)
-    print(f"  [objdump] Found {len(addrs)} unique kcov points")
+    if skipped:
+        print(f"  [objdump] Skipped {skipped} __init/__exit kcov points")
+    print(f"  [objdump] Found {len(addrs)} unique kcov points (runtime-reachable)")
     return addrs
 
 
